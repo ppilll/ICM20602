@@ -1,0 +1,20 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/home/liu/桌面/project/ebf_linux_kernel/include", 
+                "/home/liu/桌面/project/ebf_linux_kernel/include/linux/", 
+                "/home/liu/桌面/project/ebf_linux_kernel/arch/arm/include"
+                
+            ],
+            "defines": [],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "clang-x64"
+        }
+    ],
+    "version": 4
+}
