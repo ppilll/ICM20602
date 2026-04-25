@@ -18,11 +18,7 @@
 #include <linux/iio/trigger_consumer.h>
 #include <linux/iio/triggered_buffer.h>
 #include <linux/iio/sysfs.h>
-#include <linux/iio/trigger_consumer.h>
-#include <linux/iio/triggered_buffer.h>
-#include <linux/iio/sysfs.h>
-#include <linux/iio/buffer.h>
-#include <linux/iio/buffer_impl.h>
+#include <linux/iio/trigger.h>
 
 #include "ICM20602.h"
 
@@ -188,6 +184,8 @@ struct icm20602_data{
     /* IRQ / trigger resource */
 	int irq;
 	bool has_irq;
+	struct iio_trigger *trig;
+	bool drdy_trigger_enabled;
 };
 
 static const struct icm20602_config icm20602_default_config = {
@@ -396,6 +394,8 @@ static int icm20602_write_raw(struct iio_dev *indio_dev,
 	struct icm20602_data *data = iio_priv(indio_dev);
 	int ret;
 
+	if (iio_buffer_enabled(indio_dev))
+		return -EBUSY;
 	ret = iio_device_claim_direct_mode(indio_dev);
 	if (ret)
 		return ret;
@@ -515,11 +515,8 @@ static const struct iio_info icm20602_info = {
 static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 {
     struct icm20602_data *data = iio_priv(indio_dev);
-	int ret;
 
-	ret = iio_device_claim_direct_mode(indio_dev);
-	if (ret)
-		return ret;
+	dev_info(&data->spi->dev, "buffer preenable\n");
 
 	mutex_lock(&data->lock);
 	data->buffer_enabled = true;
@@ -534,20 +531,136 @@ static int icm20602_buffer_postdisable(struct iio_dev *indio_dev)
 {
     struct icm20602_data *data = iio_priv(indio_dev);
 
+	dev_info(&data->spi->dev, "buffer postdisable\n");
+
 	mutex_lock(&data->lock);
 	data->buffer_enabled = false;
 	data->trigger_enabled = false;
 	mutex_unlock(&data->lock);
 
-	iio_device_release_direct_mode(indio_dev);
-
 	return 0;
 }
 
+static int icm20602_buffer_postenable(struct iio_dev *indio_dev)
+{
+	struct icm20602_data *data = iio_priv(indio_dev);
+
+	dev_info(&data->spi->dev, "buffer postenable\n");
+
+	return iio_triggered_buffer_postenable(indio_dev);
+}
+
+static int icm20602_buffer_predisable(struct iio_dev *indio_dev)
+{
+	struct icm20602_data *data = iio_priv(indio_dev);
+
+	dev_info(&data->spi->dev, "buffer predisable\n");
+
+	return iio_triggered_buffer_predisable(indio_dev);
+}
+
+
 static const struct iio_buffer_setup_ops icm20602_buffer_ops = {
     .preenable = icm20602_buffer_preenable,
+	.postenable = icm20602_buffer_postenable,
+	.predisable = icm20602_buffer_predisable,
 	.postdisable = icm20602_buffer_postdisable,
 };
+
+static int icm20602_set_trigger_state(struct iio_trigger *trig, bool state)
+{
+	struct iio_dev *indio_dev = iio_trigger_get_drvdata(trig);
+	struct icm20602_data *data = iio_priv(indio_dev);
+	int ret;
+
+	mutex_lock(&data->lock);
+
+	ret = regmap_update_bits(data->regmap,
+				 ICM20602_INT_ENABLE,
+				 ICM20602_DATA_RDY_INT_EN,
+				 state ? ICM20602_DATA_RDY_INT_EN : 0);
+	if (!ret)
+		data->drdy_trigger_enabled = state;
+
+	mutex_unlock(&data->lock);
+
+	return ret;
+}
+
+static int icm20602_validate_trigger_device(struct iio_trigger *trig, 
+				struct iio_dev *indio_dev)
+{
+	struct iio_dev *own_indio_dev = iio_trigger_get_drvdata(trig);
+	if (indio_dev != own_indio_dev)
+		return -EINVAL;
+	return 0;
+}
+
+/**
+* @set_trigger_state：根据需求开启/关闭触发器
+* @validate_device：当当前触发器发生变化时用于验证设备的函数。
+**/
+
+static const struct iio_trigger_ops icm20602_trigger_ops = {
+	.set_trigger_state = icm20602_set_trigger_state,
+	.validate_device = icm20602_validate_trigger_device,
+};
+
+
+static irqreturn_t icm20602_irq_handler(int irq, void *dev_id)
+{	
+	struct iio_dev *indio_dev = dev_id;
+	struct icm20602_data *data = iio_priv(indio_dev);
+
+	iio_trigger_poll(data->trig);
+	return IRQ_HANDLED;
+}
+
+static int icm20602_setup_trigger(struct iio_dev *indio_dev)
+{
+	struct icm20602_data *data = iio_priv(indio_dev);
+	struct device *dev = &data->spi->dev;
+	int ret;
+
+	if (!data->has_irq)
+		return 0;
+
+	data->trig = devm_iio_trigger_alloc(dev, "%s-drdy-%s",
+					    indio_dev->name,
+					    dev_name(dev));
+	if (!data->trig)
+		return -ENOMEM;
+
+	data->trig->dev.parent = dev;
+	data->trig->ops = &icm20602_trigger_ops;
+
+	iio_trigger_set_drvdata(data->trig, indio_dev);
+
+	ret = devm_iio_trigger_register(dev, data->trig);
+
+	if (ret) {
+		dev_err(dev, "failed to register drdy trigger: %d\n", ret);
+		return ret;
+	}
+
+	ret = devm_request_irq(dev,
+					data->irq,
+					icm20602_irq_handler,
+					0,
+					dev_name(dev),
+					indio_dev);
+
+	if (ret) {
+		dev_err(dev, "failed to request irq %d: %d\n",
+			data->irq, ret);
+		return ret;
+	}
+
+	dev_info(dev, "registered data-ready trigger, irq=%d\n", data->irq);
+
+	return 0;
+
+}
 
 static int icm20602_check_chip(struct icm20602_data *data)
 {
@@ -604,8 +717,9 @@ static int icm20602_soft_reset(struct icm20602_data *data)
     return -ETIMEDOUT;
 }
 
-static int icm20602_parse_dt(struct device *dev, struct icm20602_data *data)
+static int icm20602_parse_dt(struct spi_device *spi, struct icm20602_data *data)
 {
+	struct device *dev = &spi->dev;
 	struct device_node *np = dev->of_node;
 	u32 val;
 	u8 div;
@@ -613,6 +727,13 @@ static int icm20602_parse_dt(struct device *dev, struct icm20602_data *data)
 	int ret;
 
 	data->config = icm20602_default_config;
+
+	data->irq = spi->irq;
+	data->has_irq = data->irq > 0;
+
+	if (!np)
+		return 0;
+
 	ret = of_property_read_u32(np, "invensense,accel-range", &val);
 	if (!ret) {
 		switch (val) {
@@ -713,6 +834,12 @@ static int icm20602_apply_settings(struct icm20602_data *data)
     if (ret)
         return ret;
 
+	ret = regmap_write(data->regmap,
+		   ICM20602_INT_PIN_CFG,
+		   ICM20602_INT_RD_CLEAR);
+	if (ret)
+		return ret;
+
     return 0;
 }
 
@@ -727,7 +854,7 @@ static int icm20602_init_device(struct icm20602_data *data)
     ret = icm20602_soft_reset(data);
     if (ret)
         return ret;
-
+	
 	ret = icm20602_apply_settings(data);
     if (ret)
         return ret;
@@ -748,6 +875,7 @@ static int icm20602_init_device(struct icm20602_data *data)
 
     data->buffer_enabled = false;
 	data->trigger_enabled = false;
+	data->drdy_trigger_enabled = false;
 	data->fifo_enabled = false;
 	data->fifo_watermark = 0;
 
@@ -792,7 +920,7 @@ static int icm20602_probe(struct spi_device *spi)
     }
 
 	// 解析设备树
-	ret = icm20602_parse_dt(&spi->dev, data);
+	ret = icm20602_parse_dt(spi, data);
 	if (ret) {
 		dev_err(&spi->dev, "failed to parse dt: %d\n", ret);
 		return ret;
@@ -819,11 +947,15 @@ static int icm20602_probe(struct spi_device *spi)
     ret = devm_iio_triggered_buffer_setup(&spi->dev, indio_dev,
 				      iio_pollfunc_store_time,
 				      icm20602_trigger_handler,
-				      NULL);
+				      &icm20602_buffer_ops);
     if (ret) {
 		dev_err(&spi->dev, "failed to setup triggered buffer: %d\n", ret);
 		return ret;
 	}
+
+	ret = icm20602_setup_trigger(indio_dev);
+	if (ret)
+		return ret;
 
 
     ret = devm_iio_device_register(&spi->dev, indio_dev);

@@ -77,5 +77,7 @@
 
 #define ICM20602_DATA_RDY_INT_EN    BIT(0)
 #define ICM20602_DATA_RDY_INT       BIT(0)
+#define ICM20602_INT_RD_CLEAR       BIT(4)
+#define ICM20602_LATCH_INT_EN       BIT(5)
 
 #endif

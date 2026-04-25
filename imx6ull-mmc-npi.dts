@@ -118,17 +118,17 @@
 		};
 	};
 
-	rgb_led{
-		#address-cells = <1>;
-		#size-cells = <1>;
-		pinctrl-name = "default";
-		compatible = "fire,rgb-led";
-		pinctrl-0 = <&pinctrl_rgb_led>;
-		rgb_led_red = <&gpio1 4 GPIO_ACTIVE_LOW>;
-		rgb_led_green = <&gpio4 20 GPIO_ACTIVE_LOW>;
-		rgb_led_blue = <&gpio4 19 GPIO_ACTIVE_LOW>;
-		status = "okay";
-	};
+	// rgb_led{
+	// 	#address-cells = <1>;
+	// 	#size-cells = <1>;
+	// 	pinctrl-name = "default";
+	// 	compatible = "fire,rgb-led";
+	// 	pinctrl-0 = <&pinctrl_rgb_led>;
+	// 	rgb_led_red = <&gpio1 4 GPIO_ACTIVE_LOW>;
+	// 	rgb_led_green = <&gpio4 20 GPIO_ACTIVE_LOW>;
+	// 	rgb_led_blue = <&gpio4 19 GPIO_ACTIVE_LOW>;
+	// 	status = "okay";
+	// };
 
 	key_interrupt{
 		compatible = "key_interrupt";
@@ -355,13 +355,13 @@
 		CSI-HSYNC
 		CSI-VSYNC
 	*/
-	pinctrl_rgb_led:rgb_led{
-		fsl,pins = <
-			MX6UL_PAD_GPIO1_IO04__GPIO1_IO04 0x000010B1
-			MX6UL_PAD_CSI_HSYNC__GPIO4_IO20 0x000010B1
-			MX6UL_PAD_CSI_VSYNC__GPIO4_IO19 0x000010B1
-		>;
-	};
+	// pinctrl_rgb_led:rgb_led{
+	// 	fsl,pins = <
+	// 		MX6UL_PAD_GPIO1_IO04__GPIO1_IO04 0x000010B1
+	// 		MX6UL_PAD_CSI_HSYNC__GPIO4_IO20 0x000010B1
+	// 		MX6UL_PAD_CSI_VSYNC__GPIO4_IO19 0x000010B1
+	// 	>;
+	// };
 
 	pinctrl_key:keygrp{
 		fsl,pins = <
@@ -381,6 +381,7 @@
 			MX6UL_PAD_CSI_DATA06__ECSPI1_MOSI  0x10b0
 			MX6UL_PAD_CSI_DATA04__ECSPI1_SCLK  0x10b0
 			MX6UL_PAD_CSI_DATA05__GPIO4_IO26   0x10b0
+			MX6UL_PAD_GPIO1_IO04__GPIO1_IO04 0x000010B1
 		>;
 	}; 
 };
@@ -412,13 +413,12 @@
 	ICM20602@0 {
 		compatible = "fire,ICM20602";
 		reg = <0>;
-
+		spi-max-frequency = <50000>;
 		invensense,accel-range = <8>;
 		invensense,gyro-range = <2000>;
 		sampling-frequency = <125>;
-
 		interrupt-parent = <&gpio1>;
-		interrupts = <5 IRQ_TYPE_EDGE_RISING>;
+		interrupts = <4 IRQ_TYPE_EDGE_RISING>;
 	};       
 };
 
