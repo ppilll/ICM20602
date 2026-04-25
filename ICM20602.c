@@ -66,15 +66,15 @@
 }
 
 struct icm20602_scale_entry {
-	int uscale;     /* scale µÄÎ¢Ð¡Êý²¿·Ö£¬ÅäºÏ IIO_VAL_INT_PLUS_MICRO */
-	u8 regval;      /* ÒªÐ´Èë¼Ä´æÆ÷Á¿³ÌÎ»µÄÖµ */
+	int uscale;     /* scale çš„å¾®å°æ•°éƒ¨åˆ†ï¼Œé…åˆ IIO_VAL_INT_PLUS_MICRO */
+	u8 regval;      /* è¦å†™å…¥å¯„å­˜å™¨é‡ç¨‹ä½çš„å€¼ */
 };
 
 static const struct icm20602_scale_entry icm20602_accel_scale_table[] = {
-	{ 598,  0x00 }, /* ¡À2g */
-	{ 1197, 0x08 }, /* ¡À4g */
-	{ 2394, 0x10 }, /* ¡À8g */
-	{ 4788, 0x18 }, /* ¡À16g */
+	{ 598,  0x00 }, /* Â±2g */
+	{ 1197, 0x08 }, /* Â±4g */
+	{ 2394, 0x10 }, /* Â±8g */
+	{ 4788, 0x18 }, /* Â±16g */
 };
 
 static int icm20602_accel_scale_idx_from_reg(u8 regval)
@@ -89,10 +89,10 @@ static int icm20602_accel_scale_idx_from_reg(u8 regval)
 }
 
 static const struct icm20602_scale_entry icm20602_gyro_scale_table[] = {
-	{ 133,  0x00 }, /* ¡À250 dps£¬ÏÈÓÃ micro ½üËÆ */
-	{ 266,  0x08 }, /* ¡À500 dps */
-	{ 532,  0x10 }, /* ¡À1000 dps */
-	{ 1064, 0x18 }, /* ¡À2000 dps */
+	{ 133,  0x00 }, /* Â±250 dpsï¼Œå…ˆç”¨ micro è¿‘ä¼¼ */
+	{ 266,  0x08 }, /* Â±500 dps */
+	{ 532,  0x10 }, /* Â±1000 dps */
+	{ 1064, 0x18 }, /* Â±2000 dps */
 };
 
 static int icm20602_gyro_scale_idx_from_reg(u8 regval)
@@ -171,15 +171,15 @@ struct icm20602_data{
 	struct regmap *regmap;
 	struct mutex lock;
 
-    /* Ä¬ÈÏ¼Ä´æÆ÷ÅäÖÃÄ£°å£¬¿É±» DT ¸²¸ÇºóÔÙÓ¦ÓÃ */
+    /* é»˜è®¤å¯„å­˜å™¨é…ç½®æ¨¡æ¿ï¼Œå¯è¢« DT è¦†ç›–åŽå†åº”ç”¨ */
     struct icm20602_config config;
 
-    /* µ±Ç°ÔËÐÐÊ±×´Ì¬ */
-	int accel_scale_idx;     /* µ±Ç° accel Á¿³ÌÔÚ±íÖÐµÄË÷Òý */
-	int gyro_scale_idx;      /* µ±Ç° gyro Á¿³ÌÔÚ±íÖÐµÄË÷Òý */
-	int sampling_frequency;  /* µ±Ç° ODR / ²ÉÑùÆµÂÊ£¬µ¥Î» Hz */
+    /* å½“å‰è¿è¡Œæ—¶çŠ¶æ€ */
+	int accel_scale_idx;     /* å½“å‰ accel é‡ç¨‹åœ¨è¡¨ä¸­çš„ç´¢å¼• */
+	int gyro_scale_idx;      /* å½“å‰ gyro é‡ç¨‹åœ¨è¡¨ä¸­çš„ç´¢å¼• */
+	int sampling_frequency;  /* å½“å‰ ODR / é‡‡æ ·é¢‘çŽ‡ï¼Œå•ä½ Hz */
 
-    /* buffer / trigger / fifo Ïà¹ØÔËÐÐÊ±×´Ì¬ */
+    /* buffer / trigger / fifo ç›¸å…³è¿è¡Œæ—¶çŠ¶æ€ */
 	bool buffer_enabled;
 	bool trigger_enabled;
 	bool fifo_enabled;
@@ -191,12 +191,12 @@ struct icm20602_data{
 };
 
 static const struct icm20602_config icm20602_default_config = {
-    .pwr_mgmt_1         = 0x01,           //Ê±ÖÓÉèÖÃ
-    .pwr_mgmt_2         = 0x00,          //¿ªÆôÍÓÂÝÒÇºÍ¼ÓËÙ¶È¼Æ
+    .pwr_mgmt_1         = 0x01,           //æ—¶é’Ÿè®¾ç½®
+    .pwr_mgmt_2         = 0x00,          //å¼€å¯é™€èžºä»ªå’ŒåŠ é€Ÿåº¦è®¡
     .config             = 0x01,           //176HZ 1KHZ
-    .smplrt_div         = 0x07,           //²ÉÑùËÙÂÊ SAMPLE_RATE = INTERNAL_SAMPLE_RATE / (1 + SMPLRT_DIV)
-    .gyro_config        = 0x18,           //¡À2000 dps
-    .accel_config       = 0x10,           //¡À8g
+    .smplrt_div         = 0x07,           //é‡‡æ ·é€ŸçŽ‡ SAMPLE_RATE = INTERNAL_SAMPLE_RATE / (1 + SMPLRT_DIV)
+    .gyro_config        = 0x18,           //Â±2000 dps
+    .accel_config       = 0x10,           //Â±8g
     .accel_config_2     = 0x03,           //Average 4 samples   44.8HZ   //0x23 Average 16 samples
 };
 
@@ -473,7 +473,7 @@ static irqreturn_t icm20602_trigger_handler(int irq, void *p)
 
     int ret;
 
-    // ²Á³ýscan»º³åÇøµÄÊý¾Ý
+    // æ“¦é™¤scanç¼“å†²åŒºçš„æ•°æ®
     memset(&scan, 0, sizeof(scan));
 
     mutex_lock(&data->lock);
@@ -511,7 +511,7 @@ static const struct iio_info icm20602_info = {
 
 // setip ops
 
-// ÔÚÆôÓÃ»º³åÇøÖ®Ç°ÔËÐÐµÄº¯Êý
+// åœ¨å¯ç”¨ç¼“å†²åŒºä¹‹å‰è¿è¡Œçš„å‡½æ•°
 static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 {
     struct icm20602_data *data = iio_priv(indio_dev);
@@ -529,7 +529,7 @@ static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 	return 0;
 }
 
-// ±ê¼Ç»º³åÇø½ûÓÃºóÒªÔËÐÐµÄº¯Êý
+// æ ‡è®°ç¼“å†²åŒºç¦ç”¨åŽè¦è¿è¡Œçš„å‡½æ•°
 static int icm20602_buffer_postdisable(struct iio_dev *indio_dev)
 {
     struct icm20602_data *data = iio_priv(indio_dev);
@@ -583,8 +583,8 @@ static int icm20602_soft_reset(struct icm20602_data *data)
     }
 
     /*
-     * ¹Ù·½´úÂëÊÇ Delay_ms(2) ºóÑ­»·¶Á PWR_MGMT_1£¬
-     * Ö±µ½¶Áµ½ 0x41¡£
+     * å®˜æ–¹ä»£ç æ˜¯ Delay_ms(2) åŽå¾ªçŽ¯è¯» PWR_MGMT_1ï¼Œ
+     * ç›´åˆ°è¯»åˆ° 0x41ã€‚
      */
     usleep_range(2000, 3000);
 
@@ -723,7 +723,7 @@ static int icm20602_init_device(struct icm20602_data *data)
     if(ret)
         return ret;
 
-    //¹Ù·½´úÂëÔÚ¼Ä´æÆ÷³õÊ¼»¯Ç°ÐÝÃß2ms ÎÒÃÇ»»³ÉÈí¼þ¸´Î»
+    //å®˜æ–¹ä»£ç åœ¨å¯„å­˜å™¨åˆå§‹åŒ–å‰ä¼‘çœ 2ms æˆ‘ä»¬æ¢æˆè½¯ä»¶å¤ä½
     ret = icm20602_soft_reset(data);
     if (ret)
         return ret;
@@ -732,7 +732,7 @@ static int icm20602_init_device(struct icm20602_data *data)
     if (ret)
         return ret;
 
-	/* ÓëÄ¬ÈÏÄ£°å±£³ÖÒ»ÖÂµÄÔËÐÐÊ±×´Ì¬ */
+	/* ä¸Žé»˜è®¤æ¨¡æ¿ä¿æŒä¸€è‡´çš„è¿è¡Œæ—¶çŠ¶æ€ */
     data->accel_scale_idx =
 		icm20602_accel_scale_idx_from_reg(data->config.accel_config);
 	if (data->accel_scale_idx < 0)
@@ -791,7 +791,7 @@ static int icm20602_probe(struct spi_device *spi)
         return ret;
     }
 
-	// ½âÎöÉè±¸Ê÷
+	// è§£æžè®¾å¤‡æ ‘
 	ret = icm20602_parse_dt(&spi->dev, data);
 	if (ret) {
 		dev_err(&spi->dev, "failed to parse dt: %d\n", ret);
