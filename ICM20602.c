@@ -26,6 +26,9 @@
 #define DEV_NAME  "ICM20602"
 #define _IF_DEBUG 0
 
+#define ICM20602_FIFO_FRAME_SIZE		sizeof(struct icm20602_sensor_data)
+#define ICM20602_FIFO_DEBUG_MAX_FRAMES	8
+
 #define ICM20602_CHAN_ACCEL(_axis, _addr, _scan_idx)			\
 {									                            \
 	.type = IIO_ACCEL,						                    \
@@ -270,11 +273,6 @@ static int icm20602_get_axis_from_frame(const struct iio_chan_spec *chan,
 */ 
 
 /*
-* 如果 FIFO 缓冲区为空，则读取寄存器 FIFO_DATA 将返回唯一值 0xFF，直到有新数据可用为止。
-* 普通数据永远不会指示 0xFF，因此 0xFF 给出了 FIFO 空的可靠指示。
-*/
-
-/*
 * 下面的fifo_reset，fifo_enable，fifo_disable，fifo_get_count
 * 函数不加锁，默认由调用者在需要时持有 data->lock
 */
@@ -407,8 +405,84 @@ static int icm20602_fifo_get_count(struct icm20602_data *data, int *count)
 	return 0;
 }
 
+
+/*
+* 如果 FIFO 缓冲区为空，则读取寄存器 FIFO_DATA 将返回唯一值 0xFF，直到有新数据可用为止。
+* 普通数据永远不会指示 0xFF，因此 0xFF 给出了 FIFO 空的可靠指示。
+*/
+
+// 读单帧
+static int icm20602_fifo_read_frame(struct icm20602_data *data,
+				    struct icm20602_sensor_data *frame)
+{
+	if (!frame)
+		return -EINVAL;
+
+	return regmap_bulk_read(data->regmap,
+				ICM20602_FIFO_R_W,
+				frame,
+				sizeof(*frame));
+}
+
+/*
+* 这个函数用于：
+* 读取 FIFO_COUNT
+* 计算 FIFO 中完整 frame 数
+* 最多读取少量 frame
+* 用 dev_dbg() 打印前几帧数据
+* 不接入 IIO buffer
+*/
+static int icm20602_fifo_debug_drain(struct icm20602_data *data)
+{
+	struct icm20602_sensor_data frame;
+	int ret;
+	int count;
+	int frames;
+	int leftover;
+	int i;
+
+	ret = icm20602_fifo_get_count(data, &count);
+	if (ret)
+		return ret;
+
+	frames = count / ICM20602_FIFO_FRAME_SIZE;
+	leftover = count % ICM20602_FIFO_FRAME_SIZE;
+
+	dev_info(&data->spi->dev,
+		"fifo debug: count=%d frame_size=%zu frames=%d leftover=%d\n",
+		count,
+		ICM20602_FIFO_FRAME_SIZE,
+		frames,
+		leftover);
+
+	if (!frames)
+		return 0;
+
+	if (frames > ICM20602_FIFO_DEBUG_MAX_FRAMES)
+		frames = ICM20602_FIFO_DEBUG_MAX_FRAMES;
+
+	for (i = 0; i < frames; i++) {
+		ret = icm20602_fifo_read_frame(data, &frame);
+		if (ret)
+			return ret;
+
+		dev_info(&data->spi->dev,
+			"fifo[%d]: ax=%d ay=%d az=%d temp=%d gx=%d gy=%d gz=%d\n",
+			i,
+			(s16)be16_to_cpu(frame.accel_x),
+			(s16)be16_to_cpu(frame.accel_y),
+			(s16)be16_to_cpu(frame.accel_z),
+			(s16)be16_to_cpu(frame.temp),
+			(s16)be16_to_cpu(frame.gyro_x),
+			(s16)be16_to_cpu(frame.gyro_y),
+			(s16)be16_to_cpu(frame.gyro_z));
+	}
+
+	return 0;
+}
+
 // 调试打印信息函数
-static int icm20602_fifo_debug_check(struct icm20602_data *data)
+static int icm20602_fifo_debug_check_read(struct icm20602_data *data)
 {
 	int ret;
 	int count_before;
@@ -430,9 +504,11 @@ static int icm20602_fifo_debug_check(struct icm20602_data *data)
 	if (ret)
 		goto out_disable;
 
-	dev_info(&data->spi->dev,
-		"fifo debug: count before=%d after=%d\n",
+	dev_dbg(&data->spi->dev,
+		"fifo debug read: count_before=%d count_after=%d\n",
 		count_before, count_after);
+
+	ret = icm20602_fifo_debug_drain(data);
 
 out_disable:
 	icm20602_fifo_disable(data);
@@ -1065,7 +1141,7 @@ static int icm20602_init_device(struct icm20602_data *data)
 
 		/* 临时验证 FIFO_COUNT 是否增长，用完删除 */
 	#if _IF_DEBUG
-	ret = icm20602_fifo_debug_check(data);
+	ret = icm20602_fifo_debug_check_read(data);
 	if (ret)
 		dev_warn(&data->spi->dev, "fifo debug check failed: %d\n", ret);
 	#endif
