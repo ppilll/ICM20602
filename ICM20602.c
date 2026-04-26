@@ -24,7 +24,7 @@
 
 #define DEV_CNT   1
 #define DEV_NAME  "ICM20602"
-#define _IF_DEBUG 0
+#define _IF_DEBUG 1
 
 #define ICM20602_FIFO_FRAME_SIZE		sizeof(struct icm20602_sensor_data)
 #define ICM20602_FIFO_DEBUG_MAX_FRAMES	8
@@ -504,7 +504,7 @@ static int icm20602_fifo_debug_check_read(struct icm20602_data *data)
 	if (ret)
 		goto out_disable;
 
-	dev_dbg(&data->spi->dev,
+	dev_info(&data->spi->dev,
 		"fifo debug read: count_before=%d count_after=%d\n",
 		count_before, count_after);
 
@@ -518,6 +518,19 @@ out_unlock:
 
 	return ret;
 }
+
+static void icm20602_fill_scan_from_frame(struct icm20602_scan *scan,
+					  const struct icm20602_sensor_data *frame)
+{
+	scan->accel[0] = frame->accel_x;
+	scan->accel[1] = frame->accel_y;
+	scan->accel[2] = frame->accel_z;
+
+	scan->gyro[0] = frame->gyro_x;
+	scan->gyro[1] = frame->gyro_y;
+	scan->gyro[2] = frame->gyro_z;
+}
+
 
 static int icm20602_read_raw(struct iio_dev *indio_dev,
 	struct iio_chan_spec const *chan, int *val, int *val2, long mask)
@@ -732,29 +745,54 @@ static irqreturn_t icm20602_trigger_handler(int irq, void *p)
 	struct icm20602_scan scan;
 
     int ret;
+	int count;
 
     // 擦除scan缓冲区的数据
     memset(&scan, 0, sizeof(scan));
 
     mutex_lock(&data->lock);
 
-    ret = icm20602_read_burst(data, &frame);
-    if (!ret) {
-		scan.accel[0] = frame.accel_x;
-		scan.accel[1] = frame.accel_y;
-		scan.accel[2] = frame.accel_z;
-		scan.gyro[0] = frame.gyro_x;
-		scan.gyro[1] = frame.gyro_y;
-		scan.gyro[2] = frame.gyro_z;
-	}
-	mutex_unlock(&data->lock);
+	if(data->fifo_enabled){
+		ret = icm20602_fifo_get_count(data, &count);
+		if (ret)
+			goto out_unlock;
 
+		// FIFO中未存储完整一帧则直接返回
+		if(count < ICM20602_FIFO_FRAME_SIZE){
+			ret = -EAGAIN;
+			goto out_unlock;
+		}
+
+		// 出现非整数帧
+		if (count % ICM20602_FIFO_FRAME_SIZE)
+			dev_info(&data->spi->dev,
+				"fifo count not aligned: count=%d frame_size=%zu\n",
+				count,
+				ICM20602_FIFO_FRAME_SIZE);
+
+		ret = icm20602_fifo_read_frame(data, &frame);
+		if (ret)
+			goto out_unlock;
+
+		icm20602_fill_scan_from_frame(&scan, &frame);
+	} else {
+		// 未使能FIFO的情况则正常触发buffer
+		ret = icm20602_read_burst(data, &frame);
+		if (ret)
+			goto out_unlock;
+
+		icm20602_fill_scan_from_frame(&scan, &frame);
+	}
+	
+	
+out_unlock:
+	mutex_unlock(&data->lock);
 	if (ret)
 		goto out_done;
 
 	ret = iio_push_to_buffers_with_timestamp(indio_dev, &scan, pf->timestamp);
 	if (ret < 0)
-		dev_dbg(&data->spi->dev,
+		dev_info(&data->spi->dev,
 			"failed to push buffer data: %d\n", ret);
 
 out_done:
@@ -775,30 +813,46 @@ static const struct iio_info icm20602_info = {
 static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 {
     struct icm20602_data *data = iio_priv(indio_dev);
+	int ret;
 
 	dev_info(&data->spi->dev, "buffer preenable\n");
 
 	mutex_lock(&data->lock);
+	ret = icm20602_fifo_enable(data);
+	if (ret) {
+		mutex_unlock(&data->lock);
+		return ret;
+	}
+
 	data->buffer_enabled = true;
 	data->trigger_enabled = true;
+
 	mutex_unlock(&data->lock);
 
-	return 0;
+	return ret;
 }
 
 // 标记缓冲区禁用后要运行的函数
 static int icm20602_buffer_postdisable(struct iio_dev *indio_dev)
 {
     struct icm20602_data *data = iio_priv(indio_dev);
+	int ret;
 
 	dev_info(&data->spi->dev, "buffer postdisable\n");
 
 	mutex_lock(&data->lock);
+	ret = icm20602_fifo_disable(data);
+	if (ret) {
+		mutex_unlock(&data->lock);
+		return ret;
+	}
+
 	data->buffer_enabled = false;
 	data->trigger_enabled = false;
+
 	mutex_unlock(&data->lock);
 
-	return 0;
+	return ret;
 }
 
 static int icm20602_buffer_postenable(struct iio_dev *indio_dev)
