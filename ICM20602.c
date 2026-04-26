@@ -24,6 +24,7 @@
 
 #define DEV_CNT   1
 #define DEV_NAME  "ICM20602"
+#define _IF_DEBUG 0
 
 #define ICM20602_CHAN_ACCEL(_axis, _addr, _scan_idx)			\
 {									                            \
@@ -257,6 +258,189 @@ static int icm20602_get_axis_from_frame(const struct iio_chan_spec *chan,
         default:
             return -EINVAL;
     }
+}
+
+
+/*
+* 当前没有考虑缓冲区溢出的情况
+* 如果 FIFO 缓冲区溢出，状态位 FIFO_OFLOW_INT 将自动设置为 1。
+* 该位位于 INT_STATUS（寄存器 58）中。
+* 当 FIFO 缓冲区溢出时，最旧的数据将丢失，新数据将写入 FIFO，
+* 除非寄存器 26 CONFIG 的位 [6] FIFO_MODE = 1。
+*/ 
+
+/*
+* 如果 FIFO 缓冲区为空，则读取寄存器 FIFO_DATA 将返回唯一值 0xFF，直到有新数据可用为止。
+* 普通数据永远不会指示 0xFF，因此 0xFF 给出了 FIFO 空的可靠指示。
+*/
+
+/*
+* 下面的fifo_reset，fifo_enable，fifo_disable，fifo_get_count
+* 函数不加锁，默认由调用者在需要时持有 data->lock
+*/
+static int icm20602_fifo_reset(struct icm20602_data *data)
+{
+	int ret;
+
+	/*
+	 * FIFO reset bit is usually self-clearing.
+	 *
+	 * 调用该函数前，建议已经关闭 FIFO_EN 以及 USER_CTRL.FIFO_EN，
+	 * 避免一边写 FIFO 一边 reset。
+	 */
+
+	ret = regmap_update_bits(data->regmap,
+				 ICM20602_USER_CTRL,
+				 ICM20602_USER_CTRL_FIFO_RST,
+				 ICM20602_USER_CTRL_FIFO_RST);
+	if (ret)
+		return ret;
+
+	usleep_range(1000, 2000);
+	return 0;
+}
+
+static int icm20602_fifo_enable(struct icm20602_data *data)
+{
+	int ret;
+	/*
+	 * enable 流程：
+	 * 1. disable FIFO_EN 中 accel + gyro
+	 * 2. disable USER_CTRL.FIFO_EN
+	 * 3. reset FIFO
+	 * 4. enable USER_CTRL.FIFO_EN
+	 * 5. enable FIFO_EN 中 accel + gyro
+	 * 6. data->fifo_enabled = true
+	 */
+	ret = regmap_update_bits(data->regmap,
+				 ICM20602_FIFO_EN,
+				 ICM20602_FIFO_EN_ACCEL_GYRO_MASK,
+				 0);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(data->regmap,
+				 ICM20602_USER_CTRL,
+				 ICM20602_USER_CTRL_FIFO_EN,
+				 0);
+
+	if (ret)
+		return ret;
+	
+	ret = icm20602_fifo_reset(data);
+	if (ret)
+		return ret;
+	
+	ret = regmap_update_bits(data->regmap,
+				 ICM20602_USER_CTRL,
+				 ICM20602_USER_CTRL_FIFO_EN,
+				 ICM20602_USER_CTRL_FIFO_EN);
+	if (ret)
+		return ret;
+	
+	ret = regmap_update_bits(data->regmap,
+				 ICM20602_FIFO_EN,
+				 ICM20602_FIFO_EN_ACCEL_GYRO_MASK,
+				 ICM20602_FIFO_EN_ACCEL_GYRO_MASK);
+
+	if (ret)
+		return ret;
+	
+	data->fifo_enabled = true;
+
+	return 0;
+
+}
+
+static int icm20602_fifo_disable(struct icm20602_data *data)
+{
+	int ret;
+
+	/*
+	 * disable 流程：
+	 * 1. disable FIFO_EN 中 accel + gyro
+	 * 2. disable USER_CTRL.FIFO_EN
+	 * 3. reset FIFO
+	 * 4. data->fifo_enabled = false
+	 */
+
+	ret = regmap_update_bits(data->regmap,
+				 ICM20602_FIFO_EN,
+				 ICM20602_FIFO_EN_ACCEL_GYRO_MASK,
+				 0);
+	if (ret)
+		return ret;
+
+	ret = regmap_update_bits(data->regmap,
+				 ICM20602_USER_CTRL,
+				 ICM20602_USER_CTRL_FIFO_EN,
+				 0);
+	if (ret)
+		return ret;
+
+	ret = icm20602_fifo_reset(data);
+	if (ret)
+		return ret;
+
+	data->fifo_enabled = false;
+
+	return 0;
+}
+
+static int icm20602_fifo_get_count(struct icm20602_data *data, int *count)
+{
+	int ret;
+	u8 buf[2];
+
+	if (!count)
+		return -EINVAL;
+
+	ret = regmap_bulk_read(data->regmap,
+			       ICM20602_FIFO_COUNTH,
+			       buf,
+			       sizeof(buf));
+	if (ret)
+		return ret;
+
+	*count = ((int)buf[0] << 8) | buf[1];
+
+	return 0;
+}
+
+// 调试打印信息函数
+static int icm20602_fifo_debug_check(struct icm20602_data *data)
+{
+	int ret;
+	int count_before;
+	int count_after;
+
+	mutex_lock(&data->lock);
+
+	ret = icm20602_fifo_enable(data);
+	if (ret)
+		goto out_unlock;
+
+	ret = icm20602_fifo_get_count(data, &count_before);
+	if (ret)
+		goto out_disable;
+
+	msleep(50);
+
+	ret = icm20602_fifo_get_count(data, &count_after);
+	if (ret)
+		goto out_disable;
+
+	dev_info(&data->spi->dev,
+		"fifo debug: count before=%d after=%d\n",
+		count_before, count_after);
+
+out_disable:
+	icm20602_fifo_disable(data);
+
+out_unlock:
+	mutex_unlock(&data->lock);
+
+	return ret;
 }
 
 static int icm20602_read_raw(struct iio_dev *indio_dev,
@@ -878,6 +1062,13 @@ static int icm20602_init_device(struct icm20602_data *data)
 	data->drdy_trigger_enabled = false;
 	data->fifo_enabled = false;
 	data->fifo_watermark = 0;
+
+		/* 临时验证 FIFO_COUNT 是否增长，用完删除 */
+	#if _IF_DEBUG
+	ret = icm20602_fifo_debug_check(data);
+	if (ret)
+		dev_warn(&data->spi->dev, "fifo debug check failed: %d\n", ret);
+	#endif
 
     return 0;
 }

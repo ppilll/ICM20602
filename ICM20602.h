@@ -77,7 +77,33 @@
 
 #define ICM20602_DATA_RDY_INT_EN    BIT(0)
 #define ICM20602_DATA_RDY_INT       BIT(0)
+
 #define ICM20602_INT_RD_CLEAR       BIT(4)
 #define ICM20602_LATCH_INT_EN       BIT(5)
+
+/*
+ * USER_CTRL bits.
+ * 注意确认：
+ * bit6 FIFO_EN
+ * bit2 FIFO_RST
+ */
+#define ICM20602_USER_CTRL_FIFO_EN		BIT(6)
+#define ICM20602_USER_CTRL_FIFO_RST		BIT(2)
+
+/*
+ * FIFO_EN register: 0x23
+ *
+ * ICM20602 datasheet:
+ * bit[4] GYRO_FIFO_EN
+ * bit[3] ACCEL_FIFO_EN
+ *
+ * 注意：ICM20602 的 FIFO_EN 不是 XG/YG/ZG 分轴使能。
+ */
+
+#define ICM20602_FIFO_EN_GYRO		BIT(4)
+#define ICM20602_FIFO_EN_ACCEL		BIT(3)
+
+#define ICM20602_FIFO_EN_ACCEL_GYRO_MASK \
+	(ICM20602_FIFO_EN_ACCEL | ICM20602_FIFO_EN_GYRO)
 
 #endif
