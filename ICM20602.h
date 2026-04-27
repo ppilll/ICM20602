@@ -108,4 +108,10 @@
 
 #define ICM20602_FIFO_OFLOW_INT		BIT(4)
 
+#define ICM20602_BIT_FIFO_WM_MODE            BIT(7)
+#define ICM20602_FIFO_WM_TH1_MASK            GENMASK(1, 0)
+#define ICM20602_BIT_FIFO_OFLOW_EN           BIT(4)
+#define ICM20602_BIT_DATA_RDY_INT_EN         BIT(0)
+#define ICM20602_BIT_FIFO_OFLOW_EN           BIT(4)
+
 #endif
