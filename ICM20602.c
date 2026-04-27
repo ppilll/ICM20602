@@ -26,7 +26,6 @@
 
 #define DEV_CNT   1
 #define DEV_NAME  "ICM20602"
-#define _IF_DEBUG 0
 
 #define ICM20602_FIFO_FRAME_SIZE		sizeof(struct icm20602_sensor_data)
 #define ICM20602_FIFO_DEBUG_MAX_FRAMES	8
@@ -34,6 +33,10 @@
 #define ICM20602_FIFO_WATERMARK_MIN	1
 #define ICM20602_FIFO_WATERMARK_MAX	\
 	(ICM20602_FIFO_SIZE_BYTES / ICM20602_FIFO_FRAME_SIZE)
+
+#define ICM20602_FIFO_FLUSH_MAX_LOOPS \
+	(DIV_ROUND_UP(ICM20602_FIFO_WATERMARK_MAX, ICM20602_FIFO_DRAIN_MAX_FRAMES) + 2)
+
 #define ICM20602_FIFO_WATERMARK_DEFAULT	16
 
 #define ICM20602_FIFO_DRAIN_MAX_FRAMES	16
@@ -201,6 +204,7 @@ struct icm20602_data{
 	bool fifo_enabled;
 	bool use_fifo; //用户/驱动配置意图，表示 buffer 模式下是否使用 FIFO 数据源。
 	int fifo_watermark;
+	u32 fifo_overflow_count;
 
     /* IRQ / trigger resource */
 	int irq;
@@ -424,7 +428,80 @@ static int icm20602_fifo_get_count(struct icm20602_data *data, int *count)
 	return 0;
 }
 
+/*
+* 当 FIFO 缓冲区溢出发生时，
+* INTERRUPT STATUS bit4位自动设置为 1。
+* 读取寄存器后该位清零。
+* 存在溢出返回1
+*/
+static int icm20602_fifo_check_overflow(struct icm20602_data *data,
+				bool *overflow)
+{
+	unsigned int status;
+	int ret;
 
+	if (!overflow)
+		return -EINVAL;
+
+	ret = regmap_read(data->regmap, ICM20602_INT_STATUS, &status);
+	if (ret)
+		return ret;
+
+	*overflow = !!(status & ICM20602_FIFO_OFLOW_INT);
+
+	return 0;
+}
+
+
+// 当 FIFO 状态不可信时，恢复 FIFO 到干净状态。(如FIFO数据溢出)
+static int icm20602_fifo_recover(struct icm20602_data *data)
+{
+	int ret;
+	bool restart_fifo = data->fifo_enabled;
+
+	if (restart_fifo) {
+		ret = icm20602_fifo_disable(data);
+		if (ret)
+			return ret;
+
+		ret = icm20602_fifo_enable(data);
+		if (ret)
+			return ret;
+
+		return 0;
+	}
+
+	return icm20602_fifo_reset(data);
+}
+
+static int icm20602_fifo_check_and_recover_overflow(struct icm20602_data *data)
+{
+	bool overflow;
+	int ret;
+
+	ret = icm20602_fifo_check_overflow(data, &overflow);
+	if (ret)
+		return ret;
+
+	if (!overflow)
+		return 0;
+
+	data->fifo_overflow_count++;
+
+	dev_warn_ratelimited(&data->spi->dev,
+			     "fifo overflow detected, recover fifo, count=%u\n",
+			     data->fifo_overflow_count);
+
+	ret = icm20602_fifo_recover(data);
+	if (ret)
+		return ret;
+
+	/*
+	 * 返回 1 表示这次确实发生了 overflow，并且已经恢复。
+	 * 调用者本次不应该继续 push 旧数据。
+	 */
+	return 1;
+}
 /*
 * 如果 FIFO 缓冲区为空，则读取寄存器 FIFO_DATA 将返回唯一值 0xFF，直到有新数据可用为止。
 * 普通数据永远不会指示 0xFF，因此 0xFF 给出了 FIFO 空的可靠指示。
@@ -441,101 +518,6 @@ static int icm20602_fifo_read_frame(struct icm20602_data *data,
 				ICM20602_FIFO_R_W,
 				frame,
 				sizeof(*frame));
-}
-
-/*
-* 这个函数用于：
-* 读取 FIFO_COUNT
-* 计算 FIFO 中完整 frame 数
-* 最多读取少量 frame
-* 用 dev_dbg() 打印前几帧数据
-* 不接入 IIO buffer
-*/
-static int icm20602_fifo_debug_drain(struct icm20602_data *data)
-{
-	struct icm20602_sensor_data frame;
-	int ret;
-	int count;
-	int frames;
-	int leftover;
-	int i;
-
-	ret = icm20602_fifo_get_count(data, &count);
-	if (ret)
-		return ret;
-
-	frames = count / ICM20602_FIFO_FRAME_SIZE;
-	leftover = count % ICM20602_FIFO_FRAME_SIZE;
-
-	dev_info(&data->spi->dev,
-		"fifo debug: count=%d frame_size=%zu frames=%d leftover=%d\n",
-		count,
-		ICM20602_FIFO_FRAME_SIZE,
-		frames,
-		leftover);
-
-	if (!frames)
-		return 0;
-
-	if (frames > ICM20602_FIFO_DEBUG_MAX_FRAMES)
-		frames = ICM20602_FIFO_DEBUG_MAX_FRAMES;
-
-	for (i = 0; i < frames; i++) {
-		ret = icm20602_fifo_read_frame(data, &frame);
-		if (ret)
-			return ret;
-
-		dev_info(&data->spi->dev,
-			"fifo[%d]: ax=%d ay=%d az=%d temp=%d gx=%d gy=%d gz=%d\n",
-			i,
-			(s16)be16_to_cpu(frame.accel_x),
-			(s16)be16_to_cpu(frame.accel_y),
-			(s16)be16_to_cpu(frame.accel_z),
-			(s16)be16_to_cpu(frame.temp),
-			(s16)be16_to_cpu(frame.gyro_x),
-			(s16)be16_to_cpu(frame.gyro_y),
-			(s16)be16_to_cpu(frame.gyro_z));
-	}
-
-	return 0;
-}
-
-// 调试打印信息函数
-static int icm20602_fifo_debug_check_read(struct icm20602_data *data)
-{
-	int ret;
-	int count_before;
-	int count_after;
-
-	mutex_lock(&data->lock);
-
-	ret = icm20602_fifo_enable(data);
-	if (ret)
-		goto out_unlock;
-
-	ret = icm20602_fifo_get_count(data, &count_before);
-	if (ret)
-		goto out_disable;
-
-	msleep(50);
-
-	ret = icm20602_fifo_get_count(data, &count_after);
-	if (ret)
-		goto out_disable;
-
-	dev_info(&data->spi->dev,
-		"fifo debug read: count_before=%d count_after=%d\n",
-		count_before, count_after);
-
-	ret = icm20602_fifo_debug_drain(data);
-
-out_disable:
-	icm20602_fifo_disable(data);
-
-out_unlock:
-	mutex_unlock(&data->lock);
-
-	return ret;
 }
 
 //ANCHOR - 通道读取数据操作功能
@@ -799,6 +781,12 @@ static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 	int drain_frames;
 	int i;
 
+	ret = icm20602_fifo_check_and_recover_overflow(data);
+	if (ret < 0)
+		return ret;
+
+	if (ret > 0)
+		return 0;
 
 	ret = icm20602_fifo_get_count(data, &count);
 	if (ret)
@@ -836,12 +824,7 @@ static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 		drain_frames = ICM20602_FIFO_DRAIN_MAX_FRAMES;
 	}
 
-	/*
-	 * timestamp 插值：
-	 *
-	 * FIFO 读出顺序为旧 -> 新。
-	 * 本次 timestamp 近似认为对应 drain_frames 中最后一帧。
-	 */
+	// timestamp 插值：
 	if (data->sampling_frequency > 0)
 		period_ns = div_s64(NSEC_PER_SEC, data->sampling_frequency);
 	else
@@ -871,7 +854,7 @@ static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 			 */
 			dev_dbg(&data->spi->dev,
 				"iio buffer full, stop fifo drain: %d\n", ret);
-			break;
+			return ret;
 		}
 	}
 
@@ -928,6 +911,74 @@ static ssize_t icm20602_fifo_watermark_store(struct device *dev,
 	return len;
 }
 
+//忽略 watermark把当前 FIFO 中已有的完整帧尽量 drain 到 IIO buffer
+static ssize_t icm20602_fifo_flush_store(struct device *dev,
+					 struct device_attribute *attr,
+					 const char *buf,
+					 size_t len)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct icm20602_data *data = iio_priv(indio_dev);
+	bool flush;
+	s64 timestamp;
+	int count;
+	int frames;
+	int loops = 0;
+	int ret;
+
+	ret = kstrtobool(buf, &flush);
+	if (ret)
+		return ret;
+
+	if (!flush)
+		return len;
+
+	mutex_lock(&data->lock);
+
+	/*
+	 * flush 的目标是把硬件 FIFO 中的数据推到 IIO buffer。
+	 * 所以要求：
+	 * 1. buffer 已经 enabled
+	 * 2. FIFO 当前已经 enabled
+	 */
+	if (!data->buffer_enabled || !data->fifo_enabled) {
+		ret = -EINVAL;
+		goto out_unlock;
+	}
+
+	while (loops++ < ICM20602_FIFO_FLUSH_MAX_LOOPS) {
+		ret = icm20602_fifo_get_count(data, &count);
+		if (ret)
+			goto out_unlock;
+
+		frames = icm20602_fifo_count_to_frames(count);
+		if (!frames)
+			break;
+
+		timestamp = iio_get_time_ns(indio_dev);
+
+		/*
+		 * force = true:
+		 * 即使 frames < watermark，也强制 drain 当前完整帧。
+		 */
+		ret = icm20602_fifo_drain(indio_dev, timestamp, true);
+		if (ret)
+			goto out_unlock;
+
+		/*
+		 * 如果本轮 frames <= DRAIN_MAX，理论上已经 drain 完当前已有完整帧。
+		 * 这里可以退出，避免传感器持续写 FIFO 导致 flush 循环太久。
+		 */
+		if (frames <= ICM20602_FIFO_DRAIN_MAX_FRAMES)
+			break;
+	}
+
+out_unlock:
+	mutex_unlock(&data->lock);
+
+	return ret ? ret : len;
+}
+
 static ssize_t icm20602_fifo_watermark_available_show(struct device *dev,
 						      struct device_attribute *attr,
 						      char *buf)
@@ -947,9 +998,15 @@ static IIO_DEVICE_ATTR(fifo_watermark_available, 0444,
 		       NULL,
 		       0);
 
+static IIO_DEVICE_ATTR(fifo_flush, 0200,
+		       NULL,
+		       icm20602_fifo_flush_store,
+		       0);
+
 static struct attribute *icm20602_attributes[] = {
 	&iio_dev_attr_fifo_watermark.dev_attr.attr,
 	&iio_dev_attr_fifo_watermark_available.dev_attr.attr,
+	&iio_dev_attr_fifo_flush.dev_attr.attr,
 	NULL,
 };
 
@@ -1447,13 +1504,7 @@ static int icm20602_init_device(struct icm20602_data *data)
 	data->fifo_enabled = false;
 	data->use_fifo = false;
 	data->fifo_watermark = ICM20602_FIFO_WATERMARK_DEFAULT;
-
-		/* 临时验证 FIFO_COUNT 是否增长，用完删除 */
-	#if _IF_DEBUG
-	ret = icm20602_fifo_debug_check_read(data);
-	if (ret)
-		dev_warn(&data->spi->dev, "fifo debug check failed: %d\n", ret);
-	#endif
+	data->fifo_overflow_count = 0;
 
     return 0;
 }
