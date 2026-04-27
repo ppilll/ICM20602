@@ -829,6 +829,10 @@ static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 		drain_frames = ICM20602_FIFO_DRAIN_MAX_FRAMES;
 	}
 
+	dev_dbg_ratelimited(&data->spi->dev,
+		    "fifo drain: count=%d frames=%d leftover=%d watermark=%d drain=%d force=%d\n",
+		    count, frames, leftover, watermark, drain_frames, force);
+
 	// timestamp 插值：
 	if (data->sampling_frequency > 0)
 		period_ns = div_s64(NSEC_PER_SEC, data->sampling_frequency);
@@ -907,8 +911,12 @@ static int icm20602_fifo_set_watermark_hw(struct icm20602_data *data,
         ret = regmap_write(data->regmap,
                            ICM20602_FIFO_WM_TH2,
                            wm_bytes & 0xff);
+
         if (ret)
                 return ret;
+
+		dev_info(&data->spi->dev,"fifo hw watermark: frames=%u bytes=%u TH1=0x%02x TH2=0x%02x\n",
+	 				frames,wm_bytes,(wm_bytes >> 8) & ICM20602_FIFO_WM_TH1_MASK,wm_bytes & 0xff);
 
         return 0;
 }
@@ -1258,6 +1266,7 @@ static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 	* Direct single-frame burst read path.
 	*/
 	if (trig == data->trig) {
+		dev_info(&data->spi->dev, "buffer preenable: data-ready trigger path\n");
 		ret = icm20602_fifo_disable_watermark_hw(data);
 		if (ret)
 				goto out_unlock;
@@ -1267,16 +1276,16 @@ static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 				goto out_unlock;
 
 		ret = regmap_update_bits(data->regmap,
-									ICM20602_REG_INT_ENABLE,
+									ICM20602_INT_ENABLE,
 									ICM20602_BIT_FIFO_OFLOW_EN,
 									0);
 		if (ret)
 				goto out_unlock;
 
 		ret = regmap_update_bits(data->regmap,
-									ICM20602_REG_INT_ENABLE,
-									ICM20602_BIT_DATA_RDY_INT_EN,
-									ICM20602_BIT_DATA_RDY_INT_EN);
+									ICM20602_INT_ENABLE,
+									ICM20602_DATA_RDY_INT_EN,
+									ICM20602_DATA_RDY_INT_EN);
 		if (ret)
 				goto out_unlock;
 
@@ -1292,9 +1301,12 @@ static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 	* Hardware FIFO watermark interrupt path.
 	*/
 	if (data->fifo_trig && trig == data->fifo_trig) {
+		dev_info(&data->spi->dev,
+			"buffer preenable: hardware fifo watermark trigger path, wm=%d frames\n",
+			data->fifo_watermark);
 		ret = regmap_update_bits(data->regmap,
-									ICM20602_REG_INT_ENABLE,
-									ICM20602_BIT_DATA_RDY_INT_EN,
+									ICM20602_INT_ENABLE,
+									ICM20602_DATA_RDY_INT_EN,
 									0);
 		if (ret)
 				goto out_unlock;
@@ -1303,8 +1315,7 @@ static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 		if (ret)
 				goto out_unlock;
 
-		ret = icm20602_fifo_set_watermark_hw(data,
-												data->fifo_watermark);
+		ret = icm20602_fifo_set_watermark_hw(data, data->fifo_watermark);
 		if (ret)
 				goto out_unlock;
 
@@ -1318,7 +1329,7 @@ static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 		* It only helps wake the IRQ path if overflow happens.
 		*/
 		ret = regmap_update_bits(data->regmap,
-									ICM20602_REG_INT_ENABLE,
+									ICM20602_INT_ENABLE,
 									ICM20602_BIT_FIFO_OFLOW_EN,
 									ICM20602_BIT_FIFO_OFLOW_EN);
 		if (ret)
@@ -1337,9 +1348,12 @@ static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 	* Keep your existing software watermark drain path.
 	* Do not enable chip FIFO watermark INT.
 	*/
+	dev_info(&data->spi->dev,
+		"buffer preenable: external trigger fifo drain path, wm=%d frames\n",
+		data->fifo_watermark);
 	ret = regmap_update_bits(data->regmap,
-								ICM20602_REG_INT_ENABLE,
-								ICM20602_BIT_DATA_RDY_INT_EN,
+								ICM20602_INT_ENABLE,
+								ICM20602_DATA_RDY_INT_EN,
 								0);
 	if (ret)
 			goto out_unlock;
@@ -1388,7 +1402,7 @@ static int icm20602_buffer_postdisable(struct iio_dev *indio_dev)
 
 	tmp = regmap_update_bits(data->regmap,
 								ICM20602_INT_ENABLE,
-								ICM20602_BIT_DATA_RDY_INT_EN |
+								ICM20602_DATA_RDY_INT_EN |
 								ICM20602_BIT_FIFO_OFLOW_EN,
 								0);
 	if (tmp && !ret)
@@ -1489,14 +1503,23 @@ static irqreturn_t icm20602_irq_handler(int irq, void *dev_id)
 	struct icm20602_data *data = iio_priv(indio_dev);
 
 	if (data->fifo_wm_trigger_enabled && data->fifo_trig) {
-                iio_trigger_poll(data->fifo_trig);
-                return IRQ_HANDLED;
-        }
+		dev_dbg_ratelimited(&data->spi->dev,
+				    "irq: poll fifo watermark trigger\n");
+		iio_trigger_poll(data->fifo_trig);
+		return IRQ_HANDLED;
+	}
 
-        if (data->drdy_trigger_enabled && data->trig) {
-                iio_trigger_poll(data->trig);
-                return IRQ_HANDLED;
-        }
+	if (data->drdy_trigger_enabled && data->trig) {
+		dev_dbg_ratelimited(&data->spi->dev,
+				    "irq: poll data ready trigger\n");
+		iio_trigger_poll(data->trig);
+		return IRQ_HANDLED;
+	}
+
+	dev_dbg_ratelimited(&data->spi->dev,
+			    "irq: ignored, drdy=%d fifo_wm=%d\n",
+			    data->drdy_trigger_enabled,
+			    data->fifo_wm_trigger_enabled);
 	return IRQ_HANDLED;
 }
 
@@ -1792,12 +1815,11 @@ static int icm20602_stop_device_locked(struct icm20602_data *data)
 
         data->drdy_trigger_enabled = false;
         data->fifo_wm_trigger_enabled = false;
-        data->sw_fifo_wm_trigger_enabled = false;
         data->buffer_enabled = false;
 
         tmp = regmap_update_bits(data->regmap,
                                  ICM20602_INT_ENABLE,
-                                 ICM20602_BIT_DATA_RDY_INT_EN |
+                                 ICM20602_DATA_RDY_INT_EN |
                                  ICM20602_BIT_FIFO_OFLOW_EN,
                                  0);
         if (tmp && !ret)
@@ -1825,9 +1847,6 @@ static int icm20602_stop_device_locked(struct icm20602_data *data)
 static int icm20602_stop_device(struct icm20602_data *data)
 {
         int ret;
-
-        data->sw_fifo_wm_trigger_enabled = false;
-        cancel_delayed_work_sync(&data->fifo_wm_work);
 
         mutex_lock(&data->lock);
         ret = icm20602_stop_device_locked(data);
