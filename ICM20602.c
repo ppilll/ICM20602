@@ -19,15 +19,27 @@
 #include <linux/iio/triggered_buffer.h>
 #include <linux/iio/sysfs.h>
 #include <linux/iio/trigger.h>
+#include <linux/time64.h>
+#include <linux/math64.h>
 
 #include "ICM20602.h"
 
 #define DEV_CNT   1
 #define DEV_NAME  "ICM20602"
-#define _IF_DEBUG 1
+#define _IF_DEBUG 0
 
 #define ICM20602_FIFO_FRAME_SIZE		sizeof(struct icm20602_sensor_data)
 #define ICM20602_FIFO_DEBUG_MAX_FRAMES	8
+#define ICM20602_FIFO_SIZE_BYTES		1024
+#define ICM20602_FIFO_WATERMARK_MIN	1
+#define ICM20602_FIFO_WATERMARK_MAX	\
+	(ICM20602_FIFO_SIZE_BYTES / ICM20602_FIFO_FRAME_SIZE)
+#define ICM20602_FIFO_WATERMARK_DEFAULT	16
+
+#define ICM20602_FIFO_DRAIN_MAX_FRAMES	16
+
+//ANCHOR - IIO 通道相关
+// 包括通道属性以及一些其他数据
 
 #define ICM20602_CHAN_ACCEL(_axis, _addr, _scan_idx)			\
 {									                            \
@@ -133,6 +145,10 @@ static int icm20602_odr_to_div(int hz, u8 *div, int *real_hz)
 	return 0;
 }
 
+
+//ANCHOR - 私有数据定义等
+// 结构体定义等
+
 static const struct regmap_config ICM20602_regmap_config = {
     .reg_bits = 8,
     .val_bits = 8,
@@ -183,6 +199,7 @@ struct icm20602_data{
 	bool buffer_enabled;
 	bool trigger_enabled;
 	bool fifo_enabled;
+	bool use_fifo; //用户/驱动配置意图，表示 buffer 模式下是否使用 FIFO 数据源。
 	int fifo_watermark;
 
     /* IRQ / trigger resource */
@@ -276,6 +293,8 @@ static int icm20602_get_axis_from_frame(const struct iio_chan_spec *chan,
 * 下面的fifo_reset，fifo_enable，fifo_disable，fifo_get_count
 * 函数不加锁，默认由调用者在需要时持有 data->lock
 */
+
+//ANCHOR - FIFO功能区
 static int icm20602_fifo_reset(struct icm20602_data *data)
 {
 	int ret;
@@ -519,6 +538,8 @@ out_unlock:
 	return ret;
 }
 
+//ANCHOR - 通道读取数据操作功能
+// 如read_raw，write_raw .e.t
 static void icm20602_fill_scan_from_frame(struct icm20602_scan *scan,
 					  const struct icm20602_sensor_data *frame)
 {
@@ -736,6 +757,222 @@ static int icm20602_read_avail(struct iio_dev *indio_dev,
 	}
 }
 
+//ANCHOR - FIFO与buffer接口功能
+
+// watermark固定在范围内
+static int icm20602_fifo_watermark_clamp(int watermark)
+{
+	if (watermark < ICM20602_FIFO_WATERMARK_MIN)
+		return ICM20602_FIFO_WATERMARK_MIN;
+
+	if (watermark > ICM20602_FIFO_WATERMARK_MAX)
+		return ICM20602_FIFO_WATERMARK_MAX;
+
+	return watermark;
+}
+
+
+static int icm20602_fifo_count_to_frames(int count)
+{
+	return count / ICM20602_FIFO_FRAME_SIZE;
+}
+
+static int icm20602_fifo_count_leftover(int count)
+{
+	return count % ICM20602_FIFO_FRAME_SIZE;
+}
+
+//FIFO积累多帧，然后将多帧送入buffer
+static int icm20602_fifo_drain(struct iio_dev *indio_dev,
+				s64 timestamp, bool force)
+{
+	struct icm20602_data *data = iio_priv(indio_dev);
+	struct icm20602_sensor_data frame;
+	struct icm20602_scan scan;
+	s64 period_ns;
+	s64 ts;
+	int ret;
+	int count;
+	int frames;
+	int leftover;
+	int watermark;
+	int drain_frames;
+	int i;
+
+
+	ret = icm20602_fifo_get_count(data, &count);
+	if (ret)
+		return ret;
+
+	frames = icm20602_fifo_count_to_frames(count);
+	leftover = icm20602_fifo_count_leftover(count);
+
+	if (leftover)
+		dev_dbg(&data->spi->dev,
+			"fifo has partial frame: count=%d frame_size=%zu frames=%d leftover=%d\n",
+			count, ICM20602_FIFO_FRAME_SIZE, frames, leftover);
+
+	if (!frames)
+		return 0;
+
+	watermark = icm20602_fifo_watermark_clamp(data->fifo_watermark);
+
+	/*
+	 * 非 force 模式下，FIFO 内完整帧数未达到 watermark，就先不 drain。
+	 *
+	 * leftover 不处理，留给下一次触发时自然补齐。
+	 */
+	if (!force && frames < watermark)
+		return 0;
+
+	drain_frames = frames;
+
+	if (drain_frames > ICM20602_FIFO_DRAIN_MAX_FRAMES) {
+		dev_dbg(&data->spi->dev,
+			"fifo drain limited: available=%d limit=%d\n",
+			drain_frames,
+			ICM20602_FIFO_DRAIN_MAX_FRAMES);
+
+		drain_frames = ICM20602_FIFO_DRAIN_MAX_FRAMES;
+	}
+
+	/*
+	 * timestamp 插值：
+	 *
+	 * FIFO 读出顺序为旧 -> 新。
+	 * 本次 timestamp 近似认为对应 drain_frames 中最后一帧。
+	 */
+	if (data->sampling_frequency > 0)
+		period_ns = div_s64(NSEC_PER_SEC, data->sampling_frequency);
+	else
+		period_ns = 0;
+
+	for (i = 0; i < drain_frames; i++) {
+		memset(&scan, 0, sizeof(scan));
+
+		ret = icm20602_fifo_read_frame(data, &frame);
+		if (ret)
+			return ret;
+
+		icm20602_fill_scan_from_frame(&scan, &frame);
+
+		if (period_ns)
+			ts = timestamp - period_ns * (frames - 1 - i);
+		else
+			ts = timestamp;
+
+		ret = iio_push_to_buffers_with_timestamp(indio_dev,
+							 &scan,
+							 ts);
+		if (ret < 0) {
+			/*
+			 * IIO buffer 满时不要继续读 FIFO。
+			 * 因为读 FIFO 会 pop 硬件 FIFO，继续读会导致数据被取出但无法送入 IIO buffer。
+			 */
+			dev_dbg(&data->spi->dev,
+				"iio buffer full, stop fifo drain: %d\n", ret);
+			break;
+		}
+	}
+
+	return 0;
+}
+
+//ANCHOR - watermark用户态功能区
+static ssize_t icm20602_fifo_watermark_show(struct device *dev,
+					    struct device_attribute *attr,
+					    char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct icm20602_data *data = iio_priv(indio_dev);
+	int watermark;
+
+	mutex_lock(&data->lock);
+	watermark = data->fifo_watermark;
+	mutex_unlock(&data->lock);
+
+	return sprintf(buf, "%d\n", watermark);
+}
+
+static ssize_t icm20602_fifo_watermark_store(struct device *dev,
+					     struct device_attribute *attr,
+					     const char *buf,
+					     size_t len)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct icm20602_data *data = iio_priv(indio_dev);
+	int watermark;
+	int ret;
+
+	ret = kstrtoint(buf, 10, &watermark);
+	if (ret)
+		return ret;
+
+	watermark = icm20602_fifo_watermark_clamp(watermark);
+
+	mutex_lock(&data->lock);
+
+	/*
+	 * buffer 运行时暂时不允许修改 watermark。
+	 * 否则 FIFO 正在工作时修改阈值，会让 drain 语义不清晰。
+	 */
+	if (data->buffer_enabled) {
+		mutex_unlock(&data->lock);
+		return -EBUSY;
+	}
+
+	data->fifo_watermark = watermark;
+
+	mutex_unlock(&data->lock);
+
+	return len;
+}
+
+static ssize_t icm20602_fifo_watermark_available_show(struct device *dev,
+						      struct device_attribute *attr,
+						      char *buf)
+{
+	return sprintf(buf, "%d %d\n",
+			  ICM20602_FIFO_WATERMARK_MIN,
+			  ICM20602_FIFO_WATERMARK_MAX);
+}
+
+static IIO_DEVICE_ATTR(fifo_watermark, 0644,
+		       icm20602_fifo_watermark_show,
+		       icm20602_fifo_watermark_store,
+		       0);
+
+static IIO_DEVICE_ATTR(fifo_watermark_available, 0444,
+		       icm20602_fifo_watermark_available_show,
+		       NULL,
+		       0);
+
+static struct attribute *icm20602_attributes[] = {
+	&iio_dev_attr_fifo_watermark.dev_attr.attr,
+	&iio_dev_attr_fifo_watermark_available.dev_attr.attr,
+	NULL,
+};
+
+static const struct attribute_group icm20602_attribute_group = {
+	.attrs = icm20602_attributes,
+};
+
+static const struct iio_info icm20602_info = {
+	.read_raw = icm20602_read_raw,
+	.write_raw = icm20602_write_raw,
+	.read_avail = icm20602_read_avail,
+	.attrs = &icm20602_attribute_group,
+};
+
+//ANCHOR - tigger_handler
+/*!
+* fifo_enabled == true:
+*     说明 buffer_preenable() 已经根据外部低频 trigger 启用了 FIFO
+*     走 icm20602_fifo_drain()
+* fifo_enabled == false:
+*     说明当前是 data-ready trigger 或普通 direct buffer 模式
+*     走 icm20602_read_burst()
+*/
 static irqreturn_t icm20602_trigger_handler(int irq, void *p)
 {
     struct iio_poll_func *pf = p;
@@ -745,88 +982,104 @@ static irqreturn_t icm20602_trigger_handler(int irq, void *p)
 	struct icm20602_scan scan;
 
     int ret;
-	int count;
-
-    // 擦除scan缓冲区的数据
-    memset(&scan, 0, sizeof(scan));
 
     mutex_lock(&data->lock);
 
-	if(data->fifo_enabled){
-		ret = icm20602_fifo_get_count(data, &count);
-		if (ret)
-			goto out_unlock;
+	if (data->fifo_enabled) {
+		ret = icm20602_fifo_drain(indio_dev, pf->timestamp, false);
 
-		// FIFO中未存储完整一帧则直接返回
-		if(count < ICM20602_FIFO_FRAME_SIZE){
-			ret = -EAGAIN;
-			goto out_unlock;
-		}
-
-		// 出现非整数帧
-		if (count % ICM20602_FIFO_FRAME_SIZE)
-			dev_info(&data->spi->dev,
-				"fifo count not aligned: count=%d frame_size=%zu\n",
-				count,
-				ICM20602_FIFO_FRAME_SIZE);
-
-		ret = icm20602_fifo_read_frame(data, &frame);
-		if (ret)
-			goto out_unlock;
-
-		icm20602_fill_scan_from_frame(&scan, &frame);
-	} else {
-		// 未使能FIFO的情况则正常触发buffer
-		ret = icm20602_read_burst(data, &frame);
-		if (ret)
-			goto out_unlock;
-
-		icm20602_fill_scan_from_frame(&scan, &frame);
-	}
-	
-	
-out_unlock:
-	mutex_unlock(&data->lock);
-	if (ret)
+		mutex_unlock(&data->lock);
 		goto out_done;
 
-	ret = iio_push_to_buffers_with_timestamp(indio_dev, &scan, pf->timestamp);
-	if (ret < 0)
-		dev_info(&data->spi->dev,
-			"failed to push buffer data: %d\n", ret);
+	} else {
+		// 未使能FIFO的情况则正常触发buffer
+		memset(&scan, 0, sizeof(scan));
+
+		ret = icm20602_read_burst(data, &frame);
+		if (!ret)
+			icm20602_fill_scan_from_frame(&scan, &frame);
+
+		mutex_unlock(&data->lock);
+
+		if (ret)
+			goto out_done;
+
+		ret = iio_push_to_buffers_with_timestamp(indio_dev, &scan, pf->timestamp);
+		if (ret < 0)
+			dev_dbg(&data->spi->dev,
+				"failed to push buffer data: %d\n", ret);
+	}
 
 out_done:
 	iio_trigger_notify_done(indio_dev->trig);
 	return IRQ_HANDLED;
 }
 
+//ANCHOR - buffer功能区
 
-static const struct iio_info icm20602_info = {
-    .read_raw = icm20602_read_raw,
-    .write_raw = icm20602_write_raw,
-    .read_avail = icm20602_read_avail,
-};
+static bool icm20602_is_own_drdy_trigger(struct iio_dev *indio_dev)
+{
+	struct icm20602_data *data = iio_priv(indio_dev);
 
-// setip ops
+	/*
+	 * data->trig 是本驱动注册的 ICM20602 data-ready IRQ trigger。
+	 * 如果当前 IIO device 选择的 trigger 就是它，说明当前是每帧 data-ready 触发。
+	 */
+	return data->trig && indio_dev->trig == data->trig;
+}
+
+static bool icm20602_should_use_fifo(struct iio_dev *indio_dev)
+{
+	/*
+	 * 没有 trigger 时，不使用 FIFO。
+	 * data-ready trigger 每帧触发，不适合 FIFO batch。
+	 * 其他 trigger，例如 sysfs trigger / hrtimer trigger，可以作为低频 FIFO drain 触发源。
+	 */
+	if (!indio_dev->trig)
+		return false;
+
+	if (icm20602_is_own_drdy_trigger(indio_dev))
+		return false;
+
+	/*
+	 * 如果将来你想更严格，可以在这里判断 trigger 名字或类型。
+	 * 当前阶段：只要不是本芯片 data-ready trigger，就允许 FIFO 模式。
+	 */
+	return true;
+}
 
 // 在启用缓冲区之前运行的函数
+/*
+* 当前 trigger == ICM20602 data-ready trigger:
+*     不启用 FIFO
+* 当前 trigger != ICM20602 data-ready trigger:
+*     启用 FIFO
+*/
 static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 {
-    struct icm20602_data *data = iio_priv(indio_dev);
-	int ret;
+	struct icm20602_data *data = iio_priv(indio_dev);
+	int ret = 0;
 
-	dev_info(&data->spi->dev, "buffer preenable\n");
+	dev_dbg(&data->spi->dev, "buffer preenable\n");
 
 	mutex_lock(&data->lock);
-	ret = icm20602_fifo_enable(data);
-	if (ret) {
-		mutex_unlock(&data->lock);
-		return ret;
+
+	if (icm20602_should_use_fifo(indio_dev)) {
+		ret = icm20602_fifo_enable(data);
+		if (ret)
+			goto out_unlock;
+	} else {
+		/*
+		 * data-ready trigger 模式：
+		 * 不启用 FIFO，trigger_handler 会走 direct read 单帧路径。
+		 */
+		data->fifo_enabled = false;
 	}
 
 	data->buffer_enabled = true;
 	data->trigger_enabled = true;
 
+out_unlock:
 	mutex_unlock(&data->lock);
 
 	return ret;
@@ -836,16 +1089,14 @@ static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 static int icm20602_buffer_postdisable(struct iio_dev *indio_dev)
 {
     struct icm20602_data *data = iio_priv(indio_dev);
-	int ret;
+	int ret = 0;
 
-	dev_info(&data->spi->dev, "buffer postdisable\n");
+	dev_dbg(&data->spi->dev, "buffer postdisable\n");
 
 	mutex_lock(&data->lock);
-	ret = icm20602_fifo_disable(data);
-	if (ret) {
-		mutex_unlock(&data->lock);
-		return ret;
-	}
+
+	if (data->fifo_enabled)
+		ret = icm20602_fifo_disable(data);
 
 	data->buffer_enabled = false;
 	data->trigger_enabled = false;
@@ -880,6 +1131,8 @@ static const struct iio_buffer_setup_ops icm20602_buffer_ops = {
 	.predisable = icm20602_buffer_predisable,
 	.postdisable = icm20602_buffer_postdisable,
 };
+
+//ANCHOR - trigger回调函数区
 
 static int icm20602_set_trigger_state(struct iio_trigger *trig, bool state)
 {
@@ -970,12 +1223,13 @@ static int icm20602_setup_trigger(struct iio_dev *indio_dev)
 		return ret;
 	}
 
-	dev_info(dev, "registered data-ready trigger, irq=%d\n", data->irq);
+	dev_dbg(dev, "registered data-ready trigger, irq=%d\n", data->irq);
 
 	return 0;
 
 }
 
+//ANCHOR - 初始化功能区
 static int icm20602_check_chip(struct icm20602_data *data)
 {
     int ret;
@@ -1191,7 +1445,8 @@ static int icm20602_init_device(struct icm20602_data *data)
 	data->trigger_enabled = false;
 	data->drdy_trigger_enabled = false;
 	data->fifo_enabled = false;
-	data->fifo_watermark = 0;
+	data->use_fifo = false;
+	data->fifo_watermark = ICM20602_FIFO_WATERMARK_DEFAULT;
 
 		/* 临时验证 FIFO_COUNT 是否增长，用完删除 */
 	#if _IF_DEBUG
