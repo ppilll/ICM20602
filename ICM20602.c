@@ -21,6 +21,7 @@
 #include <linux/iio/trigger.h>
 #include <linux/time64.h>
 #include <linux/math64.h>
+#include <linux/dma-mapping.h>
 
 #include "ICM20602.h"
 
@@ -41,6 +42,15 @@
 #define ICM20602_FIFO_WATERMARK_DEFAULT	16
 
 #define ICM20602_FIFO_DRAIN_MAX_FRAMES	16
+
+#define ICM20602_FIFO_MAX_BYTES         1024
+#define ICM20602_FIFO_MAX_FRAMES        \
+        (ICM20602_FIFO_MAX_BYTES / ICM20602_FIFO_FRAME_SIZE)
+
+#define ICM20602_FIFO_BURST_MAX_FRAMES  64
+#define ICM20602_FIFO_BURST_MAX_BYTES   \
+        (ICM20602_FIFO_BURST_MAX_FRAMES * ICM20602_FIFO_FRAME_SIZE)
+
 
 //ANCHOR - IIO 通道相关
 // 包括通道属性以及一些其他数据
@@ -216,6 +226,21 @@ struct icm20602_data{
 	/* New: hardware FIFO watermark trigger */
 	struct iio_trigger *fifo_trig;
 	bool fifo_wm_trigger_enabled;
+
+	/*
+	 * 1. regmap_bulk_read() 一次性从硬件 FIFO pop 多帧；
+     * 2. 后续逐帧 push 到 IIO buffer；
+     * 3. 如果 IIO buffer 满，未 push 的帧留在这里，下次继续 push。
+	*/
+	struct icm20602_sensor_data *fifo_burst_buf;
+    int fifo_pending_frames;
+    int fifo_pending_pos;
+    s64 fifo_pending_base_ts;
+    s64 fifo_pending_period_ns;
+
+    u32 fifo_burst_read_count;
+    u32 fifo_burst_push_fail_count;
+    u32 fifo_pending_overrun_count;
 };
 
 static const struct icm20602_config icm20602_default_config = {
@@ -239,6 +264,14 @@ static const struct iio_chan_spec icm20602_channels[] = {
     ICM20602_CHAN_GYRO(Z, ICM20602_GYRO_ZOUT_H, 5),
     IIO_CHAN_SOFT_TIMESTAMP(6),
 };
+
+static void icm20602_fifo_clear_pending(struct icm20602_data *data)
+{
+    data->fifo_pending_frames = 0;
+    data->fifo_pending_pos = 0;
+    data->fifo_pending_base_ts = 0;
+    data->fifo_pending_period_ns = 0;
+}
 
 static int icm20602_read_burst(struct icm20602_data *data,
 			       struct icm20602_sensor_data *frame)
@@ -472,6 +505,8 @@ static int icm20602_fifo_recover(struct icm20602_data *data)
 		ret = icm20602_fifo_enable(data);
 		if (ret)
 			return ret;
+
+		icm20602_fifo_clear_pending(data);
 
 		return 0;
 	}
@@ -769,22 +804,88 @@ static int icm20602_fifo_count_leftover(int count)
 	return count % ICM20602_FIFO_FRAME_SIZE;
 }
 
+//单次通信读取多次
+static int icm20602_fifo_read_frames(struct icm20602_data *data,
+                                     struct icm20602_sensor_data *buf,
+                                     int frames)
+{
+    size_t bytes;
+
+    if (frames <= 0 || frames > ICM20602_FIFO_DRAIN_MAX_FRAMES)
+        return -EINVAL;
+
+    bytes = frames * ICM20602_FIFO_FRAME_SIZE;
+
+    return regmap_bulk_read(data->regmap,
+                            ICM20602_FIFO_R_W,
+                            buf,
+                            bytes);
+}
+
+//处理pending部分，未处理不允许进行下次FIFO drain
+static int icm20602_fifo_push_pending(struct iio_dev *indio_dev)
+{
+    struct icm20602_data *data = iio_priv(indio_dev);
+    struct icm20602_scan scan;
+    int ret;
+    int i;
+
+    for (i = data->fifo_pending_pos;
+         i < data->fifo_pending_frames;
+         i++) {
+        s64 ts;
+
+        memset(&scan, 0, sizeof(scan));
+
+        icm20602_fill_scan_from_frame(&scan,
+                                      &data->fifo_burst_buf[i]);
+
+        ts = data->fifo_pending_base_ts +
+             (s64)i * data->fifo_pending_period_ns;
+
+        ret = iio_push_to_buffers_with_timestamp(indio_dev,
+                                                 &scan,
+                                                 ts);
+        if (ret < 0) {
+            data->fifo_pending_pos = i;
+            data->fifo_burst_push_fail_count++;
+
+            dev_dbg(&data->spi->dev,
+                    "iio buffer full, keep pending frames: pos=%d frames=%d ret=%d\n",
+                    data->fifo_pending_pos,
+                    data->fifo_pending_frames,
+                    ret);
+            return ret;
+        }
+    }
+
+    icm20602_fifo_clear_pending(data);
+
+    return 0;
+}
+
+
 //FIFO积累多帧，然后将多帧送入buffer
 static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 				s64 timestamp, bool force)
 {
 	struct icm20602_data *data = iio_priv(indio_dev);
-	struct icm20602_sensor_data frame;
-	struct icm20602_scan scan;
 	s64 period_ns;
-	s64 ts;
-	int ret;
-	int count;
-	int frames;
-	int leftover;
-	int watermark;
-	int drain_frames;
-	int i;
+    int ret;
+    int count;
+    int frames;
+    int leftover;
+    int watermark;
+    int drain_frames;
+
+	if (data->fifo_pending_frames > 0) {
+        ret = icm20602_fifo_push_pending(indio_dev);
+        if (ret < 0)
+            return ret;
+    }
+
+	if (data->fifo_pending_frames > 0)
+        return -EBUSY;
 
 	ret = icm20602_fifo_check_and_recover_overflow(data);
 	if (ret < 0)
@@ -833,39 +934,49 @@ static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 		    "fifo drain: count=%d frames=%d leftover=%d watermark=%d drain=%d force=%d\n",
 		    count, frames, leftover, watermark, drain_frames, force);
 
-	// timestamp 插值：
+	 /*
+     * 一次性从 FIFO_R_W 读取多帧。
+     * 注意：这一步会 pop 硬件 FIFO。
+     * 因此读出来后必须先存入 fifo_burst_buf，
+     * 如果 IIO push 失败，也不能覆盖这批数据。
+     */
+
+	ret = icm20602_fifo_read_frames(data,
+                                    data->fifo_burst_buf,
+                                    drain_frames);
+	if (ret)
+        return ret;
+	data->fifo_burst_read_count++;
+
 	if (data->sampling_frequency > 0)
 		period_ns = div_s64(NSEC_PER_SEC, data->sampling_frequency);
 	else
 		period_ns = 0;
 
-	for (i = 0; i < drain_frames; i++) {
-		memset(&scan, 0, sizeof(scan));
+	 /*
+     * 建立 pending 状态。
+     *
+     * 这里用 drain_frames 计算 timestamp，而不是 frames。
+     * 因为本批只读出了 drain_frames 帧。
+     *
+     * 如果 FIFO 中原本 frames > drain_frames，硬件 FIFO 中剩余帧还没读，
+     * 后面再 drain。
+     */
 
-		ret = icm20602_fifo_read_frame(data, &frame);
-		if (ret)
-			return ret;
+	data->fifo_pending_frames = drain_frames;
+    data->fifo_pending_pos = 0;
+    data->fifo_pending_period_ns = period_ns;
 
-		icm20602_fill_scan_from_frame(&scan, &frame);
-
-		if (period_ns)
-			ts = timestamp - period_ns * (frames - 1 - i);
-		else
-			ts = timestamp;
-
-		ret = iio_push_to_buffers_with_timestamp(indio_dev,
-							 &scan,
-							 ts);
-		if (ret < 0) {
-			/*
-			 * IIO buffer 满时不要继续读 FIFO。
-			 * 因为读 FIFO 会 pop 硬件 FIFO，继续读会导致数据被取出但无法送入 IIO buffer。
-			 */
-			dev_dbg(&data->spi->dev,
-				"iio buffer full, stop fifo drain: %d\n", ret);
-			return ret;
-		}
-	}
+    if (period_ns)
+		data->fifo_pending_base_ts =
+			timestamp - (s64)(frames - 1) * period_ns;
+	else
+		data->fifo_pending_base_ts = timestamp;
+	
+	// 逐帧 push 到 IIO buffer。
+	ret = icm20602_fifo_push_pending(indio_dev);
+    if (ret < 0)
+        return ret;
 
 	return 0;
 }
@@ -1260,6 +1371,8 @@ static int icm20602_buffer_preenable(struct iio_dev *indio_dev)
 	data->fifo_enabled = false;
 	data->fifo_wm_trigger_enabled = false;
 
+	icm20602_fifo_clear_pending(data);
+
 	/*
 	* Case 1: current chip data-ready trigger.
 	*
@@ -1399,6 +1512,8 @@ static int icm20602_buffer_postdisable(struct iio_dev *indio_dev)
 	data->buffer_enabled = false;
 	data->drdy_trigger_enabled = false;
 	data->fifo_wm_trigger_enabled = false;
+
+	icm20602_fifo_clear_pending(data);
 
 	tmp = regmap_update_bits(data->regmap,
 								ICM20602_INT_ENABLE,
@@ -1789,6 +1904,8 @@ static int icm20602_init_device(struct icm20602_data *data)
 	data->fifo_watermark = ICM20602_FIFO_WATERMARK_DEFAULT;
 	data->fifo_overflow_count = 0;
 
+	icm20602_fifo_clear_pending(data);
+
     return 0;
 }
 
@@ -1877,6 +1994,15 @@ static int icm20602_probe(struct spi_device *spi)
         dev_err(&spi->dev, "failed to init regmap: %d\n", ret);
         return ret;
     }
+
+	// 分配缓冲区大小
+	data->fifo_burst_buf =
+    devm_kcalloc(&data->spi->dev,
+                 ICM20602_FIFO_DRAIN_MAX_FRAMES,
+                 sizeof(*data->fifo_burst_buf),
+                 GFP_KERNEL);
+if (!data->fifo_burst_buf)
+    return -ENOMEM;
 
 	// 解析设备树
 	ret = icm20602_parse_dt(spi, data);
