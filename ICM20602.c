@@ -879,7 +879,6 @@ static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 	int watermark;
 	int drain_frames;
 	int loops = 0;
-	unsigned int wm_status = 0;
 
 	if (data->sampling_frequency > 0)
 		period_ns = div_s64(NSEC_PER_SEC, data->sampling_frequency);
@@ -889,11 +888,8 @@ static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 	watermark = icm20602_fifo_watermark_clamp(data->fifo_watermark);
 
 	/*
-	 * 先处理上一轮已经从硬件 FIFO pop 出来、但还没成功 push 到
-	 * IIO buffer 的 pending 数据。
-	 *
-	 * 这一步必须在新的硬件 FIFO drain 之前做，否则 fifo_burst_buf
-	 * 会被覆盖，导致已经 pop 出来的数据丢失。
+	 * 如果上一轮已经从硬件 FIFO pop 出数据，但还没有完全 push
+	 * 到 IIO buffer，必须先处理 pending，避免覆盖 fifo_burst_buf。
 	 */
 	if (data->fifo_pending_frames > 0) {
 		ret = icm20602_fifo_push_pending(indio_dev);
@@ -904,48 +900,19 @@ static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 	if (data->fifo_pending_frames > 0)
 		return -EBUSY;
 
-	/*
-	 * 循环 drain：
-	 *
-	 * 非 force 模式：
-	 *   只要 FIFO 中完整帧数 >= watermark，就继续 drain。
-	 *   目标是一次 trigger 进来后，尽量把 FIFO 读到低于 watermark。
-	 *
-	 * force 模式：
-	 *   只要 FIFO 中还有完整帧，就继续 drain。
-	 *
-	 * 注意：
-	 *   每次循环最多读取 ICM20602_FIFO_DRAIN_MAX_FRAMES 帧。
-	 *   如果你还保持 16，建议改成 64，否则 FIFO 很容易清不下去。
-	 */
 	while (1) {
 		loops++;
 
 		/*
-		 * 不要在 hard IRQ handler 里读这些寄存器。
-		 * 这里位于 IIO trigger handler 路径，可以做 SPI/regmap 访问。
-		 */
-		ret = regmap_read(data->regmap,
-				  ICM20602_FIFO_WM_INT_STATUS,
-				  &wm_status);
-		if (ret)
-			return ret;
-
-		/*
-		 * 如果已经 overflow，说明 FIFO 内容可能已经不连续。
-		 * 当前策略仍然沿用你原来的设计：检测到 overflow 就 recover，
-		 * 本轮不再继续读取旧 FIFO 数据。
+		 * 保持你原来的策略：
+		 * 一旦发现 FIFO overflow，就恢复 FIFO，并放弃本轮旧数据。
 		 */
 		ret = icm20602_fifo_check_and_recover_overflow(data);
 		if (ret < 0)
 			return ret;
 
-		if (ret > 0) {
-			dev_info_ratelimited(&data->spi->dev,
-				"fifo drain abort: overflow recovered, loops=%d\n",
-				loops);
+		if (ret > 0)
 			return 0;
-		}
 
 		ret = icm20602_fifo_get_count(data, &count);
 		if (ret)
@@ -960,40 +927,20 @@ static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 				count, ICM20602_FIFO_FRAME_SIZE,
 				frames, leftover);
 
-		if (!frames) {
-			dev_dbg_ratelimited(&data->spi->dev,
-				"fifo drain done: empty, loops=%d force=%d\n",
-				loops, force);
+		if (!frames)
 			break;
-		}
 
-		if (!force && frames < watermark) {
-			dev_dbg_ratelimited(&data->spi->dev,
-				"fifo drain done: below watermark, count=%d frames=%d wm=%d loops=%d\n",
-				count, frames, watermark, loops);
+		/*
+		 * 非 force 模式下，只要 FIFO 中完整帧数已经低于 watermark，
+		 * 就停止 drain，等待下一次 FIFO watermark interrupt。
+		 */
+		if (!force && frames < watermark)
 			break;
-		}
 
 		drain_frames = frames;
 		if (drain_frames > ICM20602_FIFO_DRAIN_MAX_FRAMES)
 			drain_frames = ICM20602_FIFO_DRAIN_MAX_FRAMES;
 
-		/*
-		 * 这条是关键 debug：
-		 * 看 drain 前 FIFO 有多少字节、多少完整帧、本轮准备读多少帧。
-		 */
-		dev_info_ratelimited(&data->spi->dev,
-			"drain before: loop=%d wm_status=0x%02x count=%d frames=%d leftover=%d drain=%d wm=%d force=%d\n",
-			loops, wm_status, count, frames, leftover,
-			drain_frames, watermark, force);
-
-		/*
-		 * 一次性从 FIFO_R_W 读取多帧。
-		 * 这一步会 pop 硬件 FIFO。
-		 *
-		 * 读出来后先放入 fifo_burst_buf，再逐帧 push 到 IIO buffer。
-		 * 如果 IIO push 失败，pending 机制会保留未 push 的帧。
-		 */
 		ret = icm20602_fifo_read_frames(data,
 						data->fifo_burst_buf,
 						drain_frames);
@@ -1002,34 +949,23 @@ static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 
 		data->fifo_burst_read_count++;
 
+		/*
+		 * 读完以后重新读取 FIFO count，用于判断是否已经低于
+		 * watermark，也用于估算本批数据 timestamp。
+		 */
 		ret = icm20602_fifo_get_count(data, &count_after);
 		if (ret)
 			return ret;
 
 		frames_after = icm20602_fifo_count_to_frames(count_after);
 
-		dev_info_ratelimited(&data->spi->dev,
-			"drain after: loop=%d count=%d frames=%d\n",
-			loops, count_after, frames_after);
-
 		/*
-		 * 时间戳估算：
+		 * timestamp 估算：
 		 *
-		 * timestamp 是本次 trigger handler 传进来的时间。
-		 * count_after 是本轮 drain 后硬件 FIFO 中还剩的字节数。
-		 *
-		 * 本轮读出的 drain_frames，是从 FIFO 最老的数据开始 pop。
-		 * 如果读完后 FIFO 里还剩 frames_after 帧，说明本轮最后一帧
-		 * 大约比当前 trigger timestamp 早 frames_after * period_ns。
-		 *
-		 * 因此本轮第一帧 base timestamp 估算为：
-		 *
-		 * newest_ts - (drain_frames - 1) * period_ns
-		 *
-		 * 其中 newest_ts = timestamp - frames_after * period_ns。
-		 *
-		 * 这比原来的 timestamp - (frames - 1) * period_ns 更适合
-		 * while 循环多批读取，因为每批读完后 frames_after 会变化。
+		 * timestamp 是本次 trigger handler 的时间。
+		 * 本轮读出的是 FIFO 中较老的一批数据。
+		 * 如果读完后 FIFO 里还剩 frames_after 帧，则本轮最后一帧
+		 * 大约比 timestamp 早 frames_after * period_ns。
 		 */
 		if (period_ns) {
 			newest_ts = timestamp - (s64)frames_after * period_ns;
@@ -1048,26 +984,29 @@ static int icm20602_fifo_drain(struct iio_dev *indio_dev,
 			return ret;
 
 		/*
-		 * 如果 push 没有全部完成，说明 IIO buffer 可能满了。
-		 * 这时不能继续读硬件 FIFO，否则 fifo_burst_buf 会被覆盖。
+		 * 如果 IIO buffer 满，pending 中还有未 push 的数据，
+		 * 不能继续读取硬件 FIFO，否则 fifo_burst_buf 会被覆盖。
 		 */
 		if (data->fifo_pending_frames > 0)
 			return -EBUSY;
 
 		/*
-		 * 防御性保护，避免因为硬件异常或 watermark 状态异常导致
-		 * 在一次 trigger handler 中循环太久。
-		 *
-		 * 对于 1008-byte FIFO、14-byte 硬件帧、DRAIN_MAX=64，
-		 * 正常 1~2 次循环就够。
+		 * 已经低于 watermark，就退出。
+		 * 注意这个判断要放在 loop limit 前面，否则已经成功 drain
+		 * 到低于 watermark 时也会被误判为 loop limit。
 		 */
-		if (loops >= ICM20602_FIFO_FLUSH_MAX_LOOPS) {
-			dev_warn_ratelimited(&data->spi->dev,
-				"fifo drain loop limit reached: loops=%d count_after=%d frames_after=%d wm=%d force=%d\n",
-				loops, count_after, frames_after,
-				watermark, force);
+		if (!force && frames_after < watermark)
 			break;
-		}
+
+		if (force && frames_after == 0)
+			break;
+
+		/*
+		 * 防御性保护，避免异常情况下在一次 trigger handler 中
+		 * 循环过久。
+		 */
+		if (loops >= ICM20602_FIFO_FLUSH_MAX_LOOPS)
+			break;
 	}
 
 	return 0;
