@@ -413,7 +413,7 @@
 	ICM20602@0 {
 		compatible = "fire,ICM20602";
 		reg = <0>;
-		spi-max-frequency = <50000>;
+		spi-max-frequency = <8000000>;
 		invensense,accel-range = <8>;
 		invensense,gyro-range = <2000>;
 		sampling-frequency = <125>;
